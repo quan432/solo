@@ -71,7 +71,7 @@
         .btn-join:hover { background:#ff4081;color:#000; }
         .btn-local { border-color:#a0a0ff;color:#a0a0ff; }
         .btn-local:hover { background:#a0a0ff;color:#000; }
-        .room-input { width:100%;padding:10px 12px;background:#0d0d1a;border:1px solid #333;color:#fff;font-family:'Rajdhani',sans-serif;font-size:15px;letter-spacing:1px;outline:none;border-radius:2px; }
+        .room-input { width:100%;padding:10px 12px;background:#0d0d1a;border:1px solid #333;color:#fff;font-family:'Rajdhani',sans-serif;font-size:15px;letter-spacing:1px;outline:none;border-radius:2px;pointer-events:all;cursor:text;user-select:text;-webkit-user-select:text; }
         .room-input:focus { border-color:#ff4081; }
 
         #room-code-box { background:#0d0d1a;border:1px solid #00e5ff;padding:12px 16px;text-align:center;width:100%;display:none; }
@@ -186,8 +186,10 @@
         <div class="lobby-card">
             <h3>🔗 VÀO PHÒNG</h3>
             <p>Nhập mã phòng từ bạn bè để kết nối và chiến đấu</p>
-            <input class="room-input" id="join-input" placeholder="Dán mã phòng vào đây..." />
-            <button class="net-btn btn-join" onclick="joinGame()">KẾT NỐI</button>
+            <input class="room-input" id="join-input" placeholder="Dán mã phòng vào đây..."
+                onclick="this.focus()" autocomplete="off" spellcheck="false" />
+            <button class="net-btn" style="border-color:#888;color:#888;font-size:11px;padding:8px;" onclick="pasteRoomCode()">📋 DÁN MÃ TỪ CLIPBOARD</button>
+            <button class="net-btn btn-join" onclick="joinGame()">KẾT NỐI ▶</button>
         </div>
         <!-- LOCAL -->
         <div class="lobby-card">
@@ -214,23 +216,44 @@ let myPeerId = null;
 peer = new Peer();
 peer.on('open', id => {
     myPeerId = id;
+    console.log('[PeerJS] Peer ID:', id);
     setStatus('Sẵn sàng — Chọn chế độ chơi', 'ok');
 });
-peer.on('error', err => setStatus('Lỗi: ' + err.type, 'err'));
+peer.on('error', err => {
+    console.error('[PeerJS] Error:', err);
+    setStatus('Lỗi mạng: ' + err.type, 'err');
+});
+peer.on('disconnected', () => {
+    setStatus('Mất kết nối mạng, đang thử lại...', 'wait');
+    peer.reconnect();
+});
 
 // Host nhận kết nối đến
 peer.on('connection', c => {
     conn = c;
-    setupConn();
-    setStatus('Bạn bè đã kết nối!', 'ok');
-    setTimeout(() => beginOnlineGame('host'), 600);
-});
-
-function setupConn() {
+    // Đăng ký listener ngay lập tức
     conn.on('data', onNetData);
     conn.on('close', () => setStatus('Mất kết nối!', 'err'));
-    conn.on('error', () => setStatus('Lỗi đường truyền!', 'err'));
-}
+    conn.on('error', (err) => setStatus('Lỗi: ' + (err.message||err.type||err), 'err'));
+    conn.on('open', () => {
+        setStatus('Bạn bè đã kết nối! Đang vào game...', 'ok');
+        beginOnlineGame('host');
+        // Gửi tín hiệu cho client biết host đã sẵn sàng
+        setTimeout(() => {
+            if (conn && conn.open) conn.send({ type: 'ready' });
+        }, 300);
+    });
+    // Fallback nếu đã open rồi (race condition)
+    if (conn.open) {
+        setStatus('Bạn bè đã kết nối! Đang vào game...', 'ok');
+        beginOnlineGame('host');
+        setTimeout(() => {
+            if (conn && conn.open) conn.send({ type: 'ready' });
+        }, 300);
+    }
+});
+
+
 
 function onNetData(data) {
     if (data.type === 'state') {
@@ -272,6 +295,18 @@ function onNetData(data) {
         }
     } else if (data.type === 'rematch') {
         doReset();
+    } else if (data.type === 'ready') {
+        // Host báo hiệu đã sẵn sàng → client vào game
+        if (netMode === 'client') {
+            setStatus('Host sẵn sàng! Đang vào game...', 'ok');
+            if (window._joinTimeout) clearTimeout(window._joinTimeout);
+            beginOnlineGame('client');
+        }
+    } else if (data.type === 'ping') {
+        // Client vừa kết nối xong, host gửi lại ready
+        if (netMode === 'host' && conn && conn.open) {
+            conn.send({ type: 'ready' });
+        }
     }
 }
 
@@ -299,13 +334,38 @@ window.joinGame = function() {
     if (!id) { setStatus('Hãy nhập mã phòng!', 'err'); return; }
     netMode = 'client';
     setStatus('Đang kết nối...', 'wait');
-    conn = peer.connect(id);
+
+    if (conn) { try { conn.destroy(); } catch(e){} conn = null; }
+
+    conn = peer.connect(id, { reliable: true });
+
     conn.on('open', () => {
-        setStatus('Kết nối thành công!', 'ok');
-        setupConn();
-        setTimeout(() => beginOnlineGame('client'), 600);
+        setStatus('Đã kết nối! Chờ host xác nhận...', 'ok');
+        // Đăng ký data listener SAU KHI open để nhận message 'ready' từ host
+        conn.on('data', onNetData);
+        conn.on('close', () => setStatus('Mất kết nối!', 'err'));
+        // Gửi ping để host biết client đã open
+        conn.send({ type: 'ping' });
     });
-    conn.on('error', () => setStatus('Không tìm thấy phòng!', 'err'));
+
+    conn.on('error', (err) => {
+        setStatus('Lỗi: ' + (err.message || err.type || 'Không tìm thấy phòng'), 'err');
+        netMode = 'local';
+    });
+
+    // Timeout 12 giây
+    const timeout = setTimeout(() => {
+        if (gameState === 0) { // vẫn ở menu
+            setStatus('Hết thời gian — Kiểm tra lại mã phòng!', 'err');
+            netMode = 'local';
+            try { conn && conn.destroy(); } catch(e){}
+        }
+    }, 12000);
+
+    // Hủy timeout khi đã vào game
+    const origBegin = beginOnlineGame;
+    conn.on('open', () => { /* already registered above */ });
+    window._joinTimeout = timeout;
 };
 
 window.localGame = function() {
@@ -323,10 +383,31 @@ window.copyRoomCode = function() {
     });
 };
 
+window.pasteRoomCode = function() {
+    const input = document.getElementById('join-input');
+    if (navigator.clipboard && navigator.clipboard.readText) {
+        navigator.clipboard.readText().then(text => {
+            input.value = text.trim();
+            input.style.borderColor = '#ff4081';
+        }).catch(() => {
+            // Fallback: focus the input so user can Ctrl+V manually
+            input.focus();
+            input.select();
+            setStatus('Hãy bấm Ctrl+V vào ô nhập liệu', '');
+        });
+    } else {
+        input.focus();
+        setStatus('Hãy bấm Ctrl+V vào ô nhập liệu', '');
+    }
+};
+
+let _gameStarted = false;
 function beginOnlineGame(role) {
+    if (_gameStarted) return;
+    _gameStarted = true;
     document.getElementById('overlay').style.display = 'none';
     document.getElementById('controls-hint').style.display = 'flex';
-    document.getElementById('ctrl-p2').style.display = 'none'; // online chỉ cần phím P1
+    document.getElementById('ctrl-p2').style.display = 'none';
     document.getElementById('ctrl-title-1').textContent = role === 'host' ? 'BẠN (ROBOT-01)' : 'BẠN (ROBOT-02)';
     document.getElementById('net-badge').textContent = role === 'host' ? '🟢 ONLINE — HOST' : '🟢 ONLINE — CLIENT';
     document.getElementById('net-badge').classList.add('online');
@@ -417,11 +498,11 @@ const dbTap = {}; // key → last press time
 const ALLOW_DEFAULT = new Set(['KeyV','KeyC','KeyX','KeyA','Tab','KeyZ','KeyY']);
 
 window.addEventListener('keydown', e => {
-    // Never block shortcuts (Ctrl/Meta combos) so paste/copy works
+    // Cho phép mọi thao tác khi đang focus vào input
+    const active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
+    // Cho phép Ctrl/Meta (copy, paste, reload...)
     if (e.ctrlKey || e.metaKey) return;
-
-    // Don't intercept if user is typing in an input field
-    if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
 
     if (!keys[e.code]) {
         const now = performance.now();
@@ -435,7 +516,11 @@ window.addEventListener('keydown', e => {
     keys[e.code] = true;
     e.preventDefault();
 });
-window.addEventListener('keyup', e => { keys[e.code]=false; });
+window.addEventListener('keyup', e => {
+    const active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
+    keys[e.code] = false;
+});
 
 function handleDoubleTap(code) {
     // P1 double taps
