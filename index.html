@@ -413,18 +413,26 @@ const fighters = [
 const keys = {};
 // Double-tap detection
 const dbTap = {}; // key → last press time
+// Keys that should NOT be prevented (allow paste, copy, etc.)
+const ALLOW_DEFAULT = new Set(['KeyV','KeyC','KeyX','KeyA','Tab','KeyZ','KeyY']);
+
 window.addEventListener('keydown', e => {
+    // Never block shortcuts (Ctrl/Meta combos) so paste/copy works
+    if (e.ctrlKey || e.metaKey) return;
+
+    // Don't intercept if user is typing in an input field
+    if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+
     if (!keys[e.code]) {
-        // detect double tap
         const now = performance.now();
         if (dbTap[e.code] && now - dbTap[e.code] < 280) {
             handleDoubleTap(e.code);
-            dbTap[e.code] = 0; // reset
+            dbTap[e.code] = 0;
         } else {
             dbTap[e.code] = now;
         }
     }
-    keys[e.code]=true;
+    keys[e.code] = true;
     e.preventDefault();
 });
 window.addEventListener('keyup', e => { keys[e.code]=false; });
@@ -442,10 +450,59 @@ function handleDoubleTap(code) {
 
 function doDash(f, dir) {
     if (f.dashCooldown > 0 || f.stunTimer > 0) return;
+    const fromX = f.x;
     f.x = Math.max(BOUNDS.left, Math.min(BOUNDS.right, f.x + dir * DASH_DIST));
     f.dashCooldown = 0.8;
-    fadeToAction(f, 'Running'); // closest dash-like
-    setTimeout(() => { if(f.model) fadeToAction(f,'Idle'); }, 300);
+
+    // Afterimage: 4 bóng mờ dọc theo đường dash
+    if (f.model) {
+        for (let i=0; i<4; i++) {
+            const t = (i+1)/4;
+            const ghostX = fromX + (f.x - fromX) * t;
+            const ghostColor = new THREE.Color(f.color);
+            // Clone geometry đơn giản là box làm silhouette
+            const ghost = new THREE.Mesh(
+                new THREE.BoxGeometry(0.35, 1.1, 0.25),
+                new THREE.MeshStandardMaterial({
+                    color: ghostColor, emissive: ghostColor,
+                    emissiveIntensity: 2 - i*0.4,
+                    transparent: true, opacity: 0.45 - i*0.1,
+                    depthWrite: false
+                })
+            );
+            ghost.position.set(ghostX, f.y + 0.55, 0);
+            scene.add(ghost);
+            // Fade out và xóa
+            const fadeSteps = 8;
+            let step = 0;
+            const iv = setInterval(() => {
+                step++;
+                ghost.material.opacity -= 0.06;
+                ghost.material.emissiveIntensity -= 0.2;
+                if (step >= fadeSteps) { clearInterval(iv); scene.remove(ghost); }
+            }, 30);
+        }
+
+        // Flash particle burst tại vị trí xuất phát
+        for (let j=0; j<6; j++) {
+            const spark = new THREE.Mesh(
+                new THREE.SphereGeometry(0.06, 4, 4),
+                new THREE.MeshStandardMaterial({ color:f.color, emissive:f.color, emissiveIntensity:5, transparent:true, opacity:1 })
+            );
+            spark.position.set(fromX + (Math.random()-0.5)*0.4, f.y+0.6+(Math.random()-0.5)*0.8, 0);
+            scene.add(spark);
+            const vx2=(Math.random()-0.5)*4, vy2=Math.random()*3;
+            let life2=0;
+            const sv = setInterval(()=>{
+                life2+=0.03; spark.position.x+=vx2*0.03; spark.position.y+=vy2*0.03-0.04*life2;
+                spark.material.opacity-=0.08;
+                if(spark.material.opacity<=0){clearInterval(sv);scene.remove(spark);}
+            },30);
+        }
+    }
+
+    fadeToAction(f, 'Running');
+    setTimeout(() => { if(f.model) fadeToAction(f,'Idle'); }, 280);
 }
 
 function doDoubleJump(f) {
@@ -454,6 +511,24 @@ function doDoubleJump(f) {
     f.onGround = false;
     f.jumpCount++;
     fadeToAction(f, 'Jump');
+
+    // Ring burst effect at jump position
+    for (let j=0; j<8; j++) {
+        const angle = (j/8)*Math.PI*2;
+        const spark = new THREE.Mesh(
+            new THREE.SphereGeometry(0.07, 4, 4),
+            new THREE.MeshStandardMaterial({ color:f.color, emissive:f.color, emissiveIntensity:5, transparent:true, opacity:1 })
+        );
+        spark.position.set(f.x + Math.cos(angle)*0.3, f.y+0.8, Math.sin(angle)*0.3);
+        scene.add(spark);
+        const vxS=Math.cos(angle)*3, vzS=Math.sin(angle)*3;
+        let lifeS=0;
+        const sv=setInterval(()=>{
+            lifeS+=0.04; spark.position.x+=vxS*0.04; spark.position.z+=vzS*0.04;
+            spark.material.opacity-=0.07;
+            if(spark.material.opacity<=0){clearInterval(sv);scene.remove(spark);}
+        },30);
+    }
 }
 
 // P1 controls (local) / online always uses these for "self"
@@ -524,24 +599,38 @@ function spawnBurst(attacker) {
     fadeToAction(attacker, 'Dance');
     setTimeout(() => { if(attacker.model) fadeToAction(attacker,'Idle'); }, 600);
 
+    // 10 tia bắn tuần tự, mỗi tia cách nhau 80ms, bay thẳng theo hướng facing
+    // Các tia cách nhau theo trục Y để dễ nhìn
+    const offsets = [-1.2,-0.9,-0.6,-0.3,0,0.3,0.6,0.9,1.2,1.5]; // Y offset từ chân lên đầu
     for (let i=0; i<10; i++) {
-        const angle = (i/10)*Math.PI*2;
-        const speed = 10 + Math.random()*4;
-        const vx = Math.cos(angle)*speed * (attacker.facing > 0 ? 1 : -1);
-        const vy_proj = Math.sin(angle)*speed*0.5;
-        const geo = new THREE.SphereGeometry(0.1, 6, 6);
-        const mat = new THREE.MeshStandardMaterial({
-            color: attacker.color, emissive: attacker.color, emissiveIntensity: 4,
-            transparent:true, opacity:0.85
-        });
-        const mesh = new THREE.Mesh(geo, mat);
-        mesh.position.set(attacker.x + attacker.facing*0.5, attacker.y+1.3, 0);
-        scene.add(mesh);
-        const glow = new THREE.PointLight(attacker.color, 2, 2);
-        mesh.add(glow);
-        projectiles.push({ x:attacker.x+attacker.facing*0.5, y:attacker.y+1.3, vx, vy:vy_proj, ownerId:attacker.id, dmg:10, mesh, type:'burst', life:1.5 });
+        const delay = i * 80; // 80ms giữa các tia
+        setTimeout(() => {
+            if (gameState !== GS.PLAYING) return;
+            const yOff = offsets[i];
+            // Tia dạng hình trụ dài bay ngang
+            const geo = new THREE.CylinderGeometry(0.06, 0.06, 0.6, 6);
+            geo.rotateZ(Math.PI/2); // nằm ngang
+            const col = attacker.color;
+            const mat = new THREE.MeshStandardMaterial({
+                color: col, emissive: col, emissiveIntensity: 5,
+                transparent: true, opacity: 0.95
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            const startX = attacker.x + attacker.facing * 0.7;
+            const startY = attacker.y + 0.4 + yOff * 0.18; // spread nhẹ quanh tâm
+            mesh.position.set(startX, startY, 0);
+            scene.add(mesh);
+            const glow = new THREE.PointLight(col, 3, 2.5);
+            mesh.add(glow);
+            projectiles.push({
+                x: startX, y: startY,
+                vx: attacker.facing * 22,
+                ownerId: attacker.id, dmg: 5,
+                mesh, type: 'burst', life: 0.9,
+                hit: false
+            });
+        }, delay);
     }
-    if (netMode!=='local') netSendProjectile('burst', attacker.x, attacker.y, attacker.facing, attacker.color);
 }
 
 function updateProjectiles(dt) {
@@ -564,7 +653,8 @@ function updateProjectiles(dt) {
         const target = fighters[1-p.ownerId];
         const dx = Math.abs(p.x - target.x);
         const dy = Math.abs(p.y - (target.y+1.2));
-        if (dx < 0.7 && dy < 1.2) {
+        if (!p.hit && dx < 0.7 && dy < 1.2) {
+            p.hit = true;
             scene.remove(p.mesh);
             projectiles.splice(i,1);
             let dmg = p.dmg;
