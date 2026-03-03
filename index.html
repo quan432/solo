@@ -398,15 +398,31 @@ function onNetData(data) {
         remote.x = data.x; remote.y = data.y; remote.vy = data.vy;
         remote.hp = data.hp; remote.facing = data.facing;
         remote.stunTimer = data.stunTimer; remote.shield = data.shield || 100;
+        remote.onGround = (data.y <= 0.01); // suy từ y position
         updateHP(remote); updateShieldBar(remote);
-        // Position/rotation được apply trong updateFighter → không cần set ở đây
-        // KHÔNG xử lý animation ở đây nữa — animation có event riêng
+
+        // Tự suy Idle/Walking từ trạng thái chuyển động — không cần event riêng
+        if (remote.stunTimer <= 0 && remote.onGround) {
+            const targetAnim = data.moving ? 'Walking' : 'Idle';
+            if (remote.actions[targetAnim] && remote.currentAction !== remote.actions[targetAnim]) {
+                fadeToAction(remote, targetAnim);
+            }
+        }
 
     } else if (data.type === 'anim') {
-        // Event animation riêng — chỉ nhận one-shot anims, apply 1 lần duy nhất
+        // One-shot animation events (Punch, No, Jump, Dance...)
         const remote = netMode === 'host' ? fighters[1] : fighters[0];
         if (data.anim && remote.actions[data.anim]) {
             fadeToAction(remote, data.anim);
+            // Sau one-shot, tự quay về Idle
+            if (data.anim !== 'Death' && data.anim !== 'Dance') {
+                const dur = data.anim === 'Punch' ? 500 : data.anim === 'No' ? 350 : 700;
+                setTimeout(() => {
+                    if (remote.actions['Idle'] && remote.currentAction === remote.actions[data.anim]) {
+                        fadeToAction(remote, 'Idle');
+                    }
+                }, dur);
+            }
         }
 
     } else if (data.type === 'hit') {
@@ -461,29 +477,35 @@ function onNetData(data) {
     }
 }
 
-let _lastSentAnim = ''; // track anim đã gửi để tránh gửi lại liên tục
+let _lastSentAnim = '';
+let _lastSentAnimTime = 0;
 
-// Các animation "một lần" — chỉ trigger khi bắt đầu, không lặp lại
+// One-shot animations — gửi event riêng, không lặp lại trong 600ms
 const ONE_SHOT_ANIMS = new Set(['Punch','ThumbsUp','Jump','No','Dance','Death','Running']);
 
 function netSendState(f) {
     if (!conn || !conn.open) return;
     try {
+        // Gửi vx (vận tốc ngang) để remote tự suy Idle/Walking
+        const vx = (f.x - (f._prevX || f.x));
+        f._prevX = f.x;
         conn.send({ type:'state', x:f.x, y:f.y, vy:f.vy, hp:f.hp,
-                    facing:f.facing, stunTimer:f.stunTimer, shield:f.shield });
+                    facing:f.facing, stunTimer:f.stunTimer, shield:f.shield,
+                    moving: Math.abs(vx) > 0.001 });
     } catch(e) { console.warn('[NET] sendState failed:', e); }
 }
 
-// Gửi animation event riêng — chỉ khi là one-shot VÀ chưa gửi anim này
+// Gửi animation event riêng — chỉ one-shot, dedup trong 600ms
 function netSendAnim(animName) {
     if (!conn || !conn.open) return;
-    if (!ONE_SHOT_ANIMS.has(animName)) return; // bỏ qua Idle/Walking
-    if (_lastSentAnim === animName) return;     // tránh gửi trùng
+    if (!ONE_SHOT_ANIMS.has(animName)) return;
+    const now = performance.now();
+    // Cho phép gửi lại nếu khác tên HOẶC đã quá 600ms từ lần gửi trước
+    if (_lastSentAnim === animName && now - _lastSentAnimTime < 600) return;
     _lastSentAnim = animName;
+    _lastSentAnimTime = now;
     try { conn.send({ type:'anim', anim: animName }); }
     catch(e) {}
-    // Reset sau 800ms để có thể gửi lại cùng animation nếu cần
-    setTimeout(() => { if (_lastSentAnim === animName) _lastSentAnim = ''; }, 800);
 }
 
 function netSendHit(dmg, combo) {
