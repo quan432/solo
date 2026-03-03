@@ -413,15 +413,29 @@ function onNetData(data) {
         // One-shot animation events (Punch, No, Jump, Dance...)
         const remote = netMode === 'host' ? fighters[1] : fighters[0];
         if (data.anim && remote.actions[data.anim]) {
+            const action = remote.actions[data.anim];
+
+            // Set clamp rồi play — animation chạy hết rồi dừng, không loop
+            action.setLoop(THREE.LoopOnce, 1);
+            action.clampWhenFinished = true;
             fadeToAction(remote, data.anim);
-            // Sau one-shot, tự quay về Idle
+
+            // Khi mixer báo finished → về Idle (trừ Death/Dance giữ nguyên)
             if (data.anim !== 'Death' && data.anim !== 'Dance') {
-                const dur = data.anim === 'Punch' ? 500 : data.anim === 'No' ? 350 : 700;
+                const onFinished = (e) => {
+                    if (e.action === action) {
+                        remote.mixer.removeEventListener('finished', onFinished);
+                        if (remote.actions['Idle']) fadeToAction(remote, 'Idle');
+                    }
+                };
+                remote.mixer.addEventListener('finished', onFinished);
+                // Fallback timeout phòng trường hợp event không fire
                 setTimeout(() => {
-                    if (remote.actions['Idle'] && remote.currentAction === remote.actions[data.anim]) {
+                    remote.mixer.removeEventListener('finished', onFinished);
+                    if (remote.currentAction === action && remote.actions['Idle']) {
                         fadeToAction(remote, 'Idle');
                     }
-                }, dur);
+                }, 2000);
             }
         }
 
@@ -812,6 +826,9 @@ function fadeToAction(f, name, dur=0.15) {
     const prev = f.currentAction;
     f.currentAction = f.actions[name];
     if (prev && prev !== f.currentAction) prev.fadeOut(dur);
+    // Reset về loop thường (phòng trường hợp trước đó bị set LoopOnce)
+    f.currentAction.setLoop(THREE.LoopRepeat, Infinity);
+    f.currentAction.clampWhenFinished = false;
     f.currentAction.reset().setEffectiveTimeScale(1).setEffectiveWeight(1).fadeIn(dur).play();
 }
 Promise.all([loadFighter(fighters[0]), loadFighter(fighters[1])]).then(() => {
@@ -957,7 +974,8 @@ function tryPunch(attacker, defender) {
     if (attacker.attackCooldown > 0 || attacker.stunTimer > 0) return;
     attacker.attackCooldown = 0.5;
     fadeToAction(attacker, 'Punch');
-    setTimeout(()=>{ if(attacker.model) fadeToAction(attacker,'Idle'); }, 400);
+    // Punch clip của RobotExpressive dài ~1.2s — để chạy hết trước khi về Idle
+    setTimeout(()=>{ if(attacker.model) fadeToAction(attacker,'Idle'); }, 1100);
     if (Math.abs(attacker.x-defender.x) > HIT_RANGE) return;
 
     let dmg = 8;
