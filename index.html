@@ -626,15 +626,27 @@ window.addEventListener('keyup', e => {
     keys[e.code] = false;
 });
 
+function getMyFighter() {
+    if (netMode === 'client') return fighters[1];
+    return fighters[0]; // host hoặc local P1
+}
+
 function handleDoubleTap(code) {
-    // P1 double taps
-    if (code==='KeyA') doDash(fighters[0], -1);
-    if (code==='KeyD') doDash(fighters[0],  1);
-    if (code==='KeyW') doDoubleJump(fighters[0]);
-    // P2 double taps
-    if (code==='ArrowLeft')  doDash(fighters[1], -1);
-    if (code==='ArrowRight') doDash(fighters[1],  1);
-    if (code==='ArrowUp')    doDoubleJump(fighters[1]);
+    if (netMode === 'local') {
+        // Local: P1 dùng WASD, P2 dùng arrows
+        if (code==='KeyA')       doDash(fighters[0], -1);
+        if (code==='KeyD')       doDash(fighters[0],  1);
+        if (code==='KeyW')       doDoubleJump(fighters[0]);
+        if (code==='ArrowLeft')  doDash(fighters[1], -1);
+        if (code==='ArrowRight') doDash(fighters[1],  1);
+        if (code==='ArrowUp')    doDoubleJump(fighters[1]);
+    } else {
+        // Online: cả host lẫn client đều dùng WASD (ctrlLocal[0])
+        const me = getMyFighter();
+        if (code==='KeyA')       doDash(me, -1);
+        if (code==='KeyD')       doDash(me,  1);
+        if (code==='KeyW')       doDoubleJump(me);
+    }
 }
 
 function doDash(f, dir) {
@@ -756,7 +768,16 @@ function fadeToAction(f, name, dur=0.15) {
     if (prev && prev !== f.currentAction) prev.fadeOut(dur);
     f.currentAction.reset().setEffectiveTimeScale(1).setEffectiveWeight(1).fadeIn(dur).play();
 }
-Promise.all([loadFighter(fighters[0]), loadFighter(fighters[1])]);
+Promise.all([loadFighter(fighters[0]), loadFighter(fighters[1])]).then(() => {
+    // Đảm bảo cả 2 model đứng đúng vị trí ban đầu ngay sau khi load
+    fighters.forEach(f => {
+        if (f.model) {
+            f.model.position.set(f.x, f.y, 0);
+            f.model.rotation.y = f.facing > 0 ? Math.PI/2 : -Math.PI/2;
+            f.model.visible = true;
+        }
+    });
+});
 
 // ── PROJECTILES ───────────────────────────────────────────────
 const projectiles = []; // { x, y, vx, ownerId, dmg, mesh, type }
@@ -951,7 +972,13 @@ function updateFighter(f, dt, isMine) {
     f.dashCooldown    = Math.max(0, f.dashCooldown - dt);
     f.stunTimer       = Math.max(0, f.stunTimer - dt);
 
-    if (!isMine) { if (f.mixer) f.mixer.update(dt); return; }
+    if (!isMine) {
+        // Remote fighter: luôn apply position/rotation đã sync từ mạng vào model
+        f.model.position.set(f.x, f.y, 0);
+        f.model.rotation.y = f.facing > 0 ? Math.PI/2 : -Math.PI/2;
+        if (f.mixer) f.mixer.update(dt);
+        return;
+    }
     if (f.stunTimer > 0) { if (f.mixer) f.mixer.update(dt); updateCDPips(f); return; }
 
     const ctrl = netMode==='client' ? ctrlLocal[0] : ctrlLocal[f.id];
