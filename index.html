@@ -213,7 +213,52 @@ let peer, conn;
 let netMode = 'local'; // 'local' | 'host' | 'client'
 let myPeerId = null;
 
-peer = new Peer();
+// ICE servers: STUN + nhiều TURN server công cộng để vượt Symmetric NAT
+const ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    // TURN miễn phí từ Metered.ca (public)
+    {
+        urls: 'turn:a.relay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    },
+    {
+        urls: 'turn:a.relay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    },
+    {
+        urls: 'turn:a.relay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    },
+    // TURN dự phòng từ Open Relay Project
+    {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    },
+    {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    },
+    {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    }
+];
+
+peer = new Peer({
+    config: {
+        iceServers: ICE_SERVERS,
+        iceTransportPolicy: 'all' // thử P2P trước, fallback sang TURN nếu thất bại
+    }
+});
+
 peer.on('open', id => {
     myPeerId = id;
     console.log('[PeerJS] Peer ID:', id);
@@ -337,7 +382,13 @@ window.joinGame = function() {
 
     if (conn) { try { conn.destroy(); } catch(e){} conn = null; }
 
-    conn = peer.connect(id, { reliable: true });
+    conn = peer.connect(id, {
+        reliable: true,
+        config: {
+            iceServers: ICE_SERVERS,
+            iceTransportPolicy: 'all'
+        }
+    });
 
     conn.on('open', () => {
         setStatus('Đã kết nối! Chờ host xác nhận...', 'ok');
