@@ -212,110 +212,201 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 let peer, conn;
 let netMode = 'local'; // 'local' | 'host' | 'client'
 let myPeerId = null;
+let _gameStarted = false;
+let _readyRetryInterval = null;  // host retry gửi ready
+let _pingRetryInterval  = null;  // client retry gửi ping
 
-// ICE servers: STUN + nhiều TURN server công cộng để vượt Symmetric NAT
+// ICE servers đa tầng: STUN Google + TURN TCP/UDP/443
+// Port 443 TCP là quan trọng nhất với mạng 5G/Mobile vì không bị chặn
 const ICE_SERVERS = [
+    // STUN
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    // TURN miễn phí từ Metered.ca (public)
-    {
-        urls: 'turn:a.relay.metered.ca:80',
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
-    },
-    {
-        urls: 'turn:a.relay.metered.ca:443',
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
-    },
-    {
-        urls: 'turn:a.relay.metered.ca:443?transport=tcp',
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
-    },
-    // TURN dự phòng từ Open Relay Project
-    {
-        urls: 'turn:openrelay.metered.ca:80',
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
-    },
-    {
-        urls: 'turn:openrelay.metered.ca:443',
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
-    },
-    {
-        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
-    }
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    // TURN UDP (nhanh, nhưng 5G đôi khi chặn)
+    { urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:3478',
+      username: 'openrelayproject', credential: 'openrelayproject' },
+    // TURN TCP port 443 — quan trọng nhất, không bị nhà mạng di động chặn
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:a.relay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject', credential: 'openrelayproject' },
+    // TURN TLS (giả lập HTTPS, vượt mọi firewall)
+    { urls: 'turns:openrelay.metered.ca:443',
+      username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turns:a.relay.metered.ca:443',
+      username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 
-peer = new Peer({
+const PEER_CFG = {
     config: {
         iceServers: ICE_SERVERS,
-        iceTransportPolicy: 'all' // thử P2P trước, fallback sang TURN nếu thất bại
+        iceTransportPolicy: 'all',      // thử direct trước, fallback TURN
+        iceCandidatePoolSize: 10,       // chuẩn bị sẵn nhiều candidate
+        bundlePolicy: 'max-bundle',     // gom kênh, giảm overhead
+        rtcpMuxPolicy: 'require'
     }
-});
+};
 
-peer.on('open', id => {
-    myPeerId = id;
-    console.log('[PeerJS] Peer ID:', id);
-    setStatus('Sẵn sàng — Chọn chế độ chơi', 'ok');
-});
-peer.on('error', err => {
-    console.error('[PeerJS] Error:', err);
-    setStatus('Lỗi mạng: ' + err.type, 'err');
-});
-peer.on('disconnected', () => {
-    setStatus('Mất kết nối mạng, đang thử lại...', 'wait');
-    peer.reconnect();
-});
+const CONN_OPTS = {
+    reliable:      true,
+    serialization: 'json',
+    label:         'robotduel'
+    // KHÔNG truyền config ở đây — PeerJS sẽ dùng config của Peer()
+};
 
-// Host nhận kết nối đến
-peer.on('connection', c => {
-    conn = c;
-    // Đăng ký listener ngay lập tức
-    conn.on('data', onNetData);
-    conn.on('close', () => setStatus('Mất kết nối!', 'err'));
-    conn.on('error', (err) => setStatus('Lỗi: ' + (err.message||err.type||err), 'err'));
-    conn.on('open', () => {
-        setStatus('Bạn bè đã kết nối! Đang vào game...', 'ok');
-        beginOnlineGame('host');
-        // Gửi tín hiệu cho client biết host đã sẵn sàng
-        setTimeout(() => {
-            if (conn && conn.open) conn.send({ type: 'ready' });
-        }, 300);
+// ── Khởi tạo Peer ──────────────────────────────────────────────
+function initPeer() {
+    if (peer && !peer.destroyed) peer.destroy();
+    peer = new Peer(PEER_CFG);
+
+    peer.on('open', id => {
+        myPeerId = id;
+        console.log('[NET] My Peer ID:', id);
+        setStatus('Sẵn sàng — Chọn chế độ chơi', 'ok');
     });
-    // Fallback nếu đã open rồi (race condition)
-    if (conn.open) {
-        setStatus('Bạn bè đã kết nối! Đang vào game...', 'ok');
-        beginOnlineGame('host');
-        setTimeout(() => {
-            if (conn && conn.open) conn.send({ type: 'ready' });
-        }, 300);
-    }
-});
 
+    peer.on('error', err => {
+        console.error('[NET] Peer error:', err.type, err);
+        if (err.type === 'network' || err.type === 'server-error') {
+            setStatus('Lỗi mạng (' + err.type + '), đang thử lại...', 'wait');
+            setTimeout(initPeer, 2000);
+        } else {
+            setStatus('Lỗi: ' + err.type, 'err');
+        }
+    });
 
+    peer.on('disconnected', () => {
+        console.warn('[NET] Disconnected from signaling, reconnecting...');
+        setStatus('Mất tín hiệu, đang kết nối lại...', 'wait');
+        try { peer.reconnect(); } catch(e) { setTimeout(initPeer, 2000); }
+    });
 
+    // ── HOST: nhận kết nối đến ─────────────────────────────────
+    peer.on('connection', c => {
+        console.log('[NET] Incoming connection from', c.peer);
+        conn = c;
+
+        const onOpen = () => {
+            console.log('[NET] Host conn open');
+            setStatus('Bạn bè đã kết nối! Đang vào game...', 'ok');
+
+            conn.on('data',  onNetData);
+            conn.on('close', () => { setStatus('Bạn bè ngắt kết nối!', 'err'); stopRetries(); });
+            conn.on('error', e => setStatus('Lỗi đường truyền: ' + e, 'err'));
+
+            beginOnlineGame('host');
+
+            // Gửi 'ready' và retry mỗi 600ms cho đến khi nhận ACK từ client
+            // (quan trọng với 5G vì gói đầu tiên hay bị drop)
+            let readyAck = false;
+            _readyRetryInterval = setInterval(() => {
+                if (readyAck || !conn || !conn.open) { clearInterval(_readyRetryInterval); return; }
+                console.log('[NET] Host sending ready...');
+                conn.send({ type: 'ready' });
+            }, 600);
+
+            // Lưu callback để clear khi nhận ack
+            window._onReadyAck = () => {
+                readyAck = true;
+                clearInterval(_readyRetryInterval);
+                console.log('[NET] Ready ACK received from client');
+            };
+        };
+
+        if (conn.open) { onOpen(); }
+        else           { conn.on('open', onOpen); }
+    });
+}
+initPeer();
+
+// ── CLIENT: kết nối tới host ───────────────────────────────────
+window.hostGame = function() {
+    if (!myPeerId) { setStatus('Chưa sẵn sàng, thử lại sau!', 'err'); return; }
+    netMode = 'host';
+    document.getElementById('room-code-box').style.display = 'block';
+    document.getElementById('room-code-text').textContent = myPeerId;
+    setStatus('Đang chờ bạn bè kết nối...', 'wait');
+};
+
+window.joinGame = function() {
+    const id = document.getElementById('join-input').value.trim();
+    if (!id) { setStatus('Hãy nhập mã phòng!', 'err'); return; }
+    netMode = 'client';
+    setStatus('Đang kết nối... (có thể mất 5-15 giây)', 'wait');
+    stopRetries();
+
+    if (conn) { try { conn.close(); } catch(e){} conn = null; }
+
+    console.log('[NET] Client connecting to', id);
+    conn = peer.connect(id, CONN_OPTS);
+
+    const onOpen = () => {
+        console.log('[NET] Client conn open');
+        setStatus('Đã kết nối! Chờ host...', 'ok');
+
+        conn.on('data',  onNetData);
+        conn.on('close', () => { setStatus('Host ngắt kết nối!', 'err'); stopRetries(); });
+        conn.on('error', e => setStatus('Lỗi: ' + e, 'err'));
+
+        // Gửi ping và retry mỗi 600ms cho đến khi nhận 'ready' từ host
+        let gotReady = false;
+        _pingRetryInterval = setInterval(() => {
+            if (gotReady || !conn || !conn.open) { clearInterval(_pingRetryInterval); return; }
+            console.log('[NET] Client sending ping...');
+            conn.send({ type: 'ping' });
+        }, 600);
+
+        window._onGotReady = () => {
+            gotReady = true;
+            clearInterval(_pingRetryInterval);
+        };
+    };
+
+    if (conn.open) { onOpen(); }
+    else           { conn.on('open', onOpen); }
+
+    conn.on('error', err => {
+        console.error('[NET] Connect error:', err);
+        setStatus('Không kết nối được: ' + (err.message || err.type || err), 'err');
+        netMode = 'local'; stopRetries();
+    });
+
+    // Timeout 20 giây (5G có thể ICE chậm hơn WiFi)
+    window._joinTimeout = setTimeout(() => {
+        if (_gameStarted) return;
+        setStatus('Hết thời gian — Thử lại hoặc kiểm tra mã phòng', 'err');
+        netMode = 'local'; stopRetries();
+        try { conn && conn.close(); } catch(e){}
+    }, 20000);
+};
+
+function stopRetries() {
+    if (_readyRetryInterval) { clearInterval(_readyRetryInterval); _readyRetryInterval = null; }
+    if (_pingRetryInterval)  { clearInterval(_pingRetryInterval);  _pingRetryInterval  = null; }
+    if (window._joinTimeout) { clearTimeout(window._joinTimeout);  window._joinTimeout  = null; }
+}
+
+// ── DATA HANDLER ──────────────────────────────────────────────
 function onNetData(data) {
+    if (!data || !data.type) return;
+
     if (data.type === 'state') {
         const remote = netMode === 'host' ? fighters[1] : fighters[0];
         remote.x = data.x; remote.y = data.y; remote.vy = data.vy;
         remote.hp = data.hp; remote.facing = data.facing;
-        remote.stunTimer = data.stunTimer; remote.shield = data.shield||100;
+        remote.stunTimer = data.stunTimer; remote.shield = data.shield || 100;
         updateHP(remote); updateShieldBar(remote);
         if (remote.model) {
             remote.model.position.set(remote.x, remote.y, 0);
             remote.model.rotation.y = remote.facing > 0 ? Math.PI/2 : -Math.PI/2;
         }
-        if (data.anim && remote.actions[data.anim]) {
-            if (!remote.currentAction || remote.currentAction !== remote.actions[data.anim]) {
-                fadeToAction(remote, data.anim);
-            }
+        if (data.anim && remote.actions[data.anim] && remote.currentAction !== remote.actions[data.anim]) {
+            fadeToAction(remote, data.anim);
         }
+
     } else if (data.type === 'hit') {
         const local = netMode === 'host' ? fighters[0] : fighters[1];
         local.hp = Math.max(0, local.hp - data.dmg);
@@ -326,98 +417,60 @@ function onNetData(data) {
         showDamageFloat(local, data.dmg, data.combo);
         flashScreen(netMode === 'host' ? '#ff4081' : '#00e5ff');
         if (local.hp <= 0) endGame(netMode === 'host' ? 1 : 0);
+
     } else if (data.type === 'proj') {
-        // Spawn visual-only projectile for remote player's shot
         const ownerId = netMode === 'host' ? 1 : 0;
         const color = data.color || 0xff4081;
-        if (data.ptype==='ball') {
-            const geo = new THREE.SphereGeometry(0.18,8,8);
-            const mat = new THREE.MeshStandardMaterial({color,emissive:color,emissiveIntensity:3,transparent:true,opacity:0.9});
-            const mesh = new THREE.Mesh(geo,mat);
-            mesh.position.set(data.x,data.y,0); scene.add(mesh);
-            const glow = new THREE.PointLight(color,4,3); mesh.add(glow);
-            projectiles.push({x:data.x,y:data.y,vx:data.facing*14,ownerId,dmg:10,mesh,type:'ball'});
+        if (data.ptype === 'ball') {
+            const geo = new THREE.SphereGeometry(0.18, 8, 8);
+            const mat = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 3, transparent: true, opacity: 0.9 });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.set(data.x, data.y, 0); scene.add(mesh);
+            mesh.add(new THREE.PointLight(color, 4, 3));
+            projectiles.push({ x: data.x, y: data.y, vx: data.facing * 14, ownerId, dmg: 10, mesh, type: 'ball' });
         }
-    } else if (data.type === 'rematch') {
-        doReset();
-    } else if (data.type === 'ready') {
-        // Host báo hiệu đã sẵn sàng → client vào game
-        if (netMode === 'client') {
-            setStatus('Host sẵn sàng! Đang vào game...', 'ok');
-            if (window._joinTimeout) clearTimeout(window._joinTimeout);
-            beginOnlineGame('client');
-        }
+
     } else if (data.type === 'ping') {
-        // Client vừa kết nối xong, host gửi lại ready
+        // Client ping → host gửi ready (đã có retry ở trên, đây là response ngay lập tức)
         if (netMode === 'host' && conn && conn.open) {
             conn.send({ type: 'ready' });
         }
+
+    } else if (data.type === 'ready') {
+        // Host ready → client vào game + gửi ACK
+        if (netMode === 'client') {
+            if (conn && conn.open) conn.send({ type: 'ready_ack' });
+            if (window._onGotReady) window._onGotReady();
+            stopRetries();
+            setStatus('Đã kết nối! Vào game...', 'ok');
+            beginOnlineGame('client');
+        }
+
+    } else if (data.type === 'ready_ack') {
+        // Client đã nhận ready → host dừng retry
+        if (netMode === 'host') {
+            if (window._onReadyAck) window._onReadyAck();
+        }
+
+    } else if (data.type === 'rematch') {
+        doReset();
     }
 }
 
 function netSendState(f, animName) {
     if (!conn || !conn.open) return;
-    conn.send({ type:'state', x:f.x, y:f.y, vy:f.vy, hp:f.hp, facing:f.facing, stunTimer:f.stunTimer, shield:f.shield, anim:animName||'' });
+    try {
+        conn.send({ type:'state', x:f.x, y:f.y, vy:f.vy, hp:f.hp,
+                    facing:f.facing, stunTimer:f.stunTimer, shield:f.shield, anim:animName||'' });
+    } catch(e) { console.warn('[NET] sendState failed:', e); }
 }
 
 function netSendHit(dmg, combo) {
     if (!conn || !conn.open) return;
-    conn.send({ type:'hit', dmg, combo });
+    try { conn.send({ type:'hit', dmg, combo }); }
+    catch(e) { console.warn('[NET] sendHit failed:', e); }
 }
 
-window.hostGame = function() {
-    if (!myPeerId) { setStatus('Chưa sẵn sàng, thử lại!', 'err'); return; }
-    netMode = 'host';
-    const box = document.getElementById('room-code-box');
-    box.style.display = 'block';
-    document.getElementById('room-code-text').textContent = myPeerId;
-    setStatus('Đang chờ bạn bè kết nối...', 'wait');
-};
-
-window.joinGame = function() {
-    const id = document.getElementById('join-input').value.trim();
-    if (!id) { setStatus('Hãy nhập mã phòng!', 'err'); return; }
-    netMode = 'client';
-    setStatus('Đang kết nối...', 'wait');
-
-    if (conn) { try { conn.destroy(); } catch(e){} conn = null; }
-
-    conn = peer.connect(id, {
-        reliable: true,
-        config: {
-            iceServers: ICE_SERVERS,
-            iceTransportPolicy: 'all'
-        }
-    });
-
-    conn.on('open', () => {
-        setStatus('Đã kết nối! Chờ host xác nhận...', 'ok');
-        // Đăng ký data listener SAU KHI open để nhận message 'ready' từ host
-        conn.on('data', onNetData);
-        conn.on('close', () => setStatus('Mất kết nối!', 'err'));
-        // Gửi ping để host biết client đã open
-        conn.send({ type: 'ping' });
-    });
-
-    conn.on('error', (err) => {
-        setStatus('Lỗi: ' + (err.message || err.type || 'Không tìm thấy phòng'), 'err');
-        netMode = 'local';
-    });
-
-    // Timeout 12 giây
-    const timeout = setTimeout(() => {
-        if (gameState === 0) { // vẫn ở menu
-            setStatus('Hết thời gian — Kiểm tra lại mã phòng!', 'err');
-            netMode = 'local';
-            try { conn && conn.destroy(); } catch(e){}
-        }
-    }, 12000);
-
-    // Hủy timeout khi đã vào game
-    const origBegin = beginOnlineGame;
-    conn.on('open', () => { /* already registered above */ });
-    window._joinTimeout = timeout;
-};
 
 window.localGame = function() {
     netMode = 'local';
@@ -452,10 +505,10 @@ window.pasteRoomCode = function() {
     }
 };
 
-let _gameStarted = false;
 function beginOnlineGame(role) {
     if (_gameStarted) return;
     _gameStarted = true;
+    stopRetries();
     document.getElementById('overlay').style.display = 'none';
     document.getElementById('controls-hint').style.display = 'flex';
     document.getElementById('ctrl-p2').style.display = 'none';
@@ -1016,6 +1069,7 @@ function doReset() {
 }
 
 window.restartGame = function() {
+    _gameStarted = false;
     if (netMode!=='local' && conn && conn.open) conn.send({type:'rematch'});
     doReset();
 };
