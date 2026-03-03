@@ -408,10 +408,12 @@ function onNetData(data) {
         }
 
     } else if (data.type === 'hit') {
+        // Máy nhận: trừ HP local fighter (người đang bị đánh ở máy này)
         const local = netMode === 'host' ? fighters[0] : fighters[1];
         local.hp = Math.max(0, local.hp - data.dmg);
         local.stunTimer = 0.3;
         updateHP(local);
+        updateShieldBar(local);
         fadeToAction(local, 'No');
         setTimeout(() => { if (local.model) fadeToAction(local, 'Idle'); }, 300);
         showDamageFloat(local, data.dmg, data.combo);
@@ -596,19 +598,20 @@ const fighters = [
 ];
 
 const keys = {};
+const justPressed = {}; // chỉ true đúng 1 frame khi nhấn xuống — tránh spam attack
 // Double-tap detection
 const dbTap = {}; // key → last press time
 // Keys that should NOT be prevented (allow paste, copy, etc.)
 const ALLOW_DEFAULT = new Set(['KeyV','KeyC','KeyX','KeyA','Tab','KeyZ','KeyY']);
 
 window.addEventListener('keydown', e => {
-    // Cho phép mọi thao tác khi đang focus vào input
     const active = document.activeElement;
     if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
-    // Cho phép Ctrl/Meta (copy, paste, reload...)
     if (e.ctrlKey || e.metaKey) return;
 
     if (!keys[e.code]) {
+        // Lần đầu nhấn: đánh dấu justPressed và kiểm tra double-tap
+        justPressed[e.code] = true;
         const now = performance.now();
         if (dbTap[e.code] && now - dbTap[e.code] < 280) {
             handleDoubleTap(e.code);
@@ -617,6 +620,7 @@ window.addEventListener('keydown', e => {
             dbTap[e.code] = now;
         }
     }
+    // Nếu giữ phím (e.repeat), KHÔNG set justPressed lại
     keys[e.code] = true;
     e.preventDefault();
 });
@@ -624,6 +628,7 @@ window.addEventListener('keyup', e => {
     const active = document.activeElement;
     if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
     keys[e.code] = false;
+    justPressed[e.code] = false;
 });
 
 function getMyFighter() {
@@ -884,19 +889,21 @@ function updateProjectiles(dt) {
 function applyDamage(attacker, defender, dmg) {
     const now = performance.now();
     if (now-attacker.lastHitTime < 1500) attacker.comboCount++; else attacker.comboCount=1;
-    attacker.lastHitTime=now;
+    attacker.lastHitTime = now;
 
-    if (netMode!=='local') {
+    // Luôn apply damage local để HP bar và KO hoạt động đúng ở cả 2 máy
+    defender.hp = Math.max(0, defender.hp - dmg);
+    updateHP(defender);
+    updateShieldBar(defender);
+    showDamageFloat(defender, dmg, attacker.comboCount);
+    flashScreen(attacker.id===0 ? '#00e5ff' : '#ff4081');
+
+    if (netMode !== 'local') {
+        // Gửi hit event để máy kia cũng cập nhật HP + animation
         netSendHit(dmg, attacker.comboCount);
-        showDamageFloat(defender, dmg, attacker.comboCount);
-        flashScreen(attacker.id===0?'#00e5ff':'#ff4081');
-    } else {
-        defender.hp = Math.max(0, defender.hp-dmg);
-        updateHP(defender); updateShieldBar(defender);
-        showDamageFloat(defender, dmg, attacker.comboCount);
-        flashScreen(attacker.id===0?'#00e5ff':'#ff4081');
-        if (defender.hp<=0) endGame(attacker.id);
     }
+
+    if (defender.hp <= 0) endGame(attacker.id);
 }
 
 function netSendProjectile(type, x, y, facing, color) {
@@ -1005,23 +1012,27 @@ function updateFighter(f, dt, isMine) {
     f.x = Math.max(BOUNDS.left, Math.min(BOUNDS.right, f.x));
 
     // Jump (single tap, double jump handled via double-tap)
-    if (keys[ctrl.up] && f.onGround && !f.blocking) {
+    if (justPressed[ctrl.up] && f.onGround && !f.blocking) {
+        justPressed[ctrl.up] = false;
         f.vy=JUMP_VEL; f.onGround=false; f.jumpCount=1;
         fadeToAction(f,'Jump'); animName='Jump';
     }
     f.vy += GRAVITY*dt; f.y += f.vy*dt;
     if (f.y <= FLOOR_Y) { f.y=0; f.vy=0; if(!f.onGround){f.onGround=true; f.jumpCount=0;} }
 
-    // Attacks
+    // Attacks — dùng justPressed thay vì keys để chỉ fire 1 lần mỗi lần nhấn
     if (gameState===GS.PLAYING && !f.blocking) {
         const other = fighters[1-f.id];
-        if (keys[ctrl.punch] && f.attackCooldown<=0 && f.stunTimer<=0) {
+        if (justPressed[ctrl.punch] && f.attackCooldown<=0 && f.stunTimer<=0) {
+            justPressed[ctrl.punch] = false;
             tryPunch(f, other); animName='Punch';
         }
-        if (keys[ctrl.ball]  && f.ballCooldown<=0  && f.stunTimer<=0) {
-            spawnBall(f);  animName='ThumbsUp';
+        if (justPressed[ctrl.ball] && f.ballCooldown<=0 && f.stunTimer<=0) {
+            justPressed[ctrl.ball] = false;
+            spawnBall(f); animName='ThumbsUp';
         }
-        if (keys[ctrl.burst] && f.burstCooldown<=0 && f.stunTimer<=0) {
+        if (justPressed[ctrl.burst] && f.burstCooldown<=0 && f.stunTimer<=0) {
+            justPressed[ctrl.burst] = false;
             spawnBurst(f); animName='Dance';
         }
     }
