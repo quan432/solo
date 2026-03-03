@@ -399,11 +399,13 @@ function onNetData(data) {
         remote.hp = data.hp; remote.facing = data.facing;
         remote.stunTimer = data.stunTimer; remote.shield = data.shield || 100;
         updateHP(remote); updateShieldBar(remote);
-        if (remote.model) {
-            remote.model.position.set(remote.x, remote.y, 0);
-            remote.model.rotation.y = remote.facing > 0 ? Math.PI/2 : -Math.PI/2;
-        }
-        if (data.anim && remote.actions[data.anim] && remote.currentAction !== remote.actions[data.anim]) {
+        // Position/rotation được apply trong updateFighter → không cần set ở đây
+        // KHÔNG xử lý animation ở đây nữa — animation có event riêng
+
+    } else if (data.type === 'anim') {
+        // Event animation riêng — chỉ nhận one-shot anims, apply 1 lần duy nhất
+        const remote = netMode === 'host' ? fighters[1] : fighters[0];
+        if (data.anim && remote.actions[data.anim]) {
             fadeToAction(remote, data.anim);
         }
 
@@ -459,12 +461,29 @@ function onNetData(data) {
     }
 }
 
-function netSendState(f, animName) {
+let _lastSentAnim = ''; // track anim đã gửi để tránh gửi lại liên tục
+
+// Các animation "một lần" — chỉ trigger khi bắt đầu, không lặp lại
+const ONE_SHOT_ANIMS = new Set(['Punch','ThumbsUp','Jump','No','Dance','Death','Running']);
+
+function netSendState(f) {
     if (!conn || !conn.open) return;
     try {
         conn.send({ type:'state', x:f.x, y:f.y, vy:f.vy, hp:f.hp,
-                    facing:f.facing, stunTimer:f.stunTimer, shield:f.shield, anim:animName||'' });
+                    facing:f.facing, stunTimer:f.stunTimer, shield:f.shield });
     } catch(e) { console.warn('[NET] sendState failed:', e); }
+}
+
+// Gửi animation event riêng — chỉ khi là one-shot VÀ chưa gửi anim này
+function netSendAnim(animName) {
+    if (!conn || !conn.open) return;
+    if (!ONE_SHOT_ANIMS.has(animName)) return; // bỏ qua Idle/Walking
+    if (_lastSentAnim === animName) return;     // tránh gửi trùng
+    _lastSentAnim = animName;
+    try { conn.send({ type:'anim', anim: animName }); }
+    catch(e) {}
+    // Reset sau 800ms để có thể gửi lại cùng animation nếu cần
+    setTimeout(() => { if (_lastSentAnim === animName) _lastSentAnim = ''; }, 800);
 }
 
 function netSendHit(dmg, combo) {
@@ -1051,10 +1070,12 @@ function updateFighter(f, dt, isMine) {
     if (f.mixer) f.mixer.update(dt);
     updateCDPips(f);
 
-    // Send state ~30fps
+    // Send state ~30fps (vị trí, HP, shield — KHÔNG kèm animation)
     if (netMode!=='local') {
         const now = performance.now();
-        if (now-lastNetSend > 33) { netSendState(f, animName); lastNetSend=now; }
+        if (now-lastNetSend > 33) { netSendState(f); lastNetSend=now; }
+        // Gửi anim event riêng ngay khi có thay đổi (không chờ 33ms)
+        if (animName) netSendAnim(animName);
     }
 }
 
@@ -1097,6 +1118,7 @@ function doReset() {
         f.shield=SHIELD_MAX; f.blocking=false; f.jumpCount=0;
         updateHP(f); updateShieldBar(f); updateCDPips(f);
     });
+    _lastSentAnim = '';
     // Clear projectiles
     projectiles.forEach(p=>scene.remove(p.mesh));
     projectiles.length=0;
